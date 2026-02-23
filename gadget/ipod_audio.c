@@ -472,6 +472,19 @@ static int ipod_audio_stop(struct ipod_audio* audio) {
 	if (audio->ss && audio->period_us)
 		schedule_delayed_work(&audio->silence_work,
 				 usecs_to_jiffies(audio->period_us));
+	return 0;
+}
+
+static int ipod_audio_set_alt(struct usb_function *func, unsigned intf, unsigned alt)
+{
+	struct ipod_audio *audio = func_to_ipod_audio(func);
+	DBG(func->config->cdev, " = %s(%u,%u) \n", __FUNCTION__, intf, alt);
+
+	if (intf == audio->ac_intf) {
+		if (alt > 0) {
+			ERROR(func->config->cdev, "%s:%d Error!\n", __func__, __LINE__);
+			return -EINVAL;
+		}
 		return 0;
 	}
 
