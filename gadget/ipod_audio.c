@@ -210,14 +210,19 @@ static void ipod_audio_iso_complete(struct usb_ep *ep, struct usb_request *req)
 	//trace_printk("status=%d ep_enabled=%d\n", req->status, audio->in_ep_enabled);
 	//trace_ipod_req_out_done(req);
 
-	//if (req->status == -ESHUTDOWN)
-	if (!audio->in_ep_enabled || req->status)
+	/* If the endpoint is being torn down, drop the request entirely. */
+	if (!audio->in_ep_enabled)
 		return;
-	
-	// if(req->status) {
-	// 	usb_ep_free_request(audio->in_ep, req);
-	// 	return;
-	// }
+
+	/*
+	 * On transient USB errors (e.g. -EPROTO, -ETIMEDOUT) skip the data
+	 * copy but still re-queue so the transfer pipeline stays alive.
+	 * Without this every error permanently removes a request from
+	 * circulation; once all NUM_USB_AUDIO_TRANSFERS are gone audio
+	 * silently dies until the host does a set_alt stop/start cycle.
+	 */
+	if (req->status)
+		goto exit;
 
 	//if (audio->dma_area == NULL)
 	//	goto exit;
