@@ -21,6 +21,7 @@
 #include <sound/pcm.h>
 #include <sound/pcm_params.h>
 #include <linux/platform_device.h>
+#include <linux/workqueue.h>
 
 
 
@@ -60,6 +61,15 @@ struct ipod_audio {
 	struct usb_request **in_req;
 
 	int cnt;
+
+	/*
+	 * While the USB endpoint is stopped but the PCM stream is still running,
+	 * this work advances hw_ptr and calls snd_pcm_period_elapsed so that
+	 * the ALSA ring buffer never fills up (which would cause an XRUN and
+	 * kill bluealsa-aplay).
+	 */
+	struct delayed_work silence_work;
+	unsigned int period_us; /* period duration in microseconds */
 };
 
 static inline struct ipod_audio *func_to_ipod_audio(struct usb_function *f)
@@ -122,6 +132,10 @@ static int ipod_audio_pcm_hw_params(struct snd_pcm_substream *substream,
 			audio->dma_bytes = substream->runtime->dma_bytes;
 			audio->dma_area = substream->runtime->dma_area;
 			audio->period_size = params_period_bytes(hw_params);
+			/* period duration in µs = period_frames * 1e6 / rate */
+			audio->period_us = (unsigned int)div_u64(
+				(u64)params_period_size(hw_params) * USEC_PER_SEC,
+				params_rate(hw_params));
 		}
 	}
 	return err;
@@ -168,8 +182,11 @@ static int ipod_audio_pcm_trigger(struct snd_pcm_substream *substream, int cmd)
 	spin_unlock_irqrestore(&audio->play_lock, flags);
 
 	/* Clear buffer after Play stops */
-	if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK && !audio->ss)
+	if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK && !audio->ss) {
+		/* PCM stream is ending - stop the silence drain work */
+		cancel_delayed_work(&audio->silence_work);
 		memset(audio->rbuf, 0, MAX_USB_AUDIO_PACKET_SIZE * NUM_USB_AUDIO_TRANSFERS);
+	}
 
 	return err;
 }
@@ -184,6 +201,30 @@ static int ipod_audio_pcm_null(struct snd_pcm_substream *substream)
 {
 	struct ipod_audio *audio = snd_pcm_substream_chip(substream);
 	return 0;
+}
+
+static void ipod_audio_silence_work_fn(struct work_struct *work)
+{
+	struct ipod_audio *audio = container_of(to_delayed_work(work),
+						struct ipod_audio, silence_work);
+	struct snd_pcm_substream *substream;
+	unsigned long flags;
+
+	spin_lock_irqsave(&audio->play_lock, flags);
+	substream = audio->ss;
+	/* Only keep draining if USB is still stopped and stream is alive */
+	if (!audio->in_ep_enabled && substream && audio->period_size && audio->dma_bytes) {
+		audio->hw_ptr = (audio->hw_ptr + audio->period_size) % audio->dma_bytes;
+	} else {
+		substream = NULL;
+	}
+	spin_unlock_irqrestore(&audio->play_lock, flags);
+
+	if (substream) {
+		snd_pcm_period_elapsed(substream);
+		schedule_delayed_work(&audio->silence_work,
+				 usecs_to_jiffies(audio->period_us));
+	}
 }
 
 static struct snd_pcm_ops ipod_audio_pcm_ops = {
@@ -338,12 +379,33 @@ static int ipod_audio_start(struct ipod_audio* audio) {
 	int ret = 0;
 	int i;
 	struct usb_request *req;
+	unsigned long flags;
 
 	pr_info("audio start\n");
 
 	if(audio->in_ep_enabled) {
 		return 0;
 	}
+
+	/* Stop draining the ALSA buffer with silence - USB is taking over */
+	cancel_delayed_work_sync(&audio->silence_work);
+
+	/*
+	 * Sync our hw_ptr to just behind the current appl_ptr so we play the
+	 * freshest data in the ring buffer instead of whatever stale content
+	 * was there before the USB stop.  Leave MIN_PERIODS worth of data as
+	 * a margin so the car has something to consume right away.
+	 */
+	spin_lock_irqsave(&audio->play_lock, flags);
+	if (audio->ss && audio->dma_bytes && audio->period_size) {
+		struct snd_pcm_runtime *runtime = audio->ss->runtime;
+		snd_pcm_uframes_t appl = READ_ONCE(runtime->control->appl_ptr);
+		snd_pcm_uframes_t margin = runtime->period_size * MIN_PERIODS;
+		snd_pcm_uframes_t target = (appl > margin) ? (appl - margin) : 0;
+		audio->hw_ptr = frames_to_bytes(runtime, target % runtime->buffer_size);
+	}
+	spin_unlock_irqrestore(&audio->play_lock, flags);
+
 	audio->in_ep_enabled = true;
 	ret = config_ep_by_speed(audio->func.config->cdev->gadget, &audio->func, audio->in_ep);
 	if (ret)
@@ -399,22 +461,17 @@ static int ipod_audio_stop(struct ipod_audio* audio) {
 			audio->in_req[i] = NULL;
 		}
 	}
-				
 	usb_ep_disable(audio->in_ep);
 
-	return 0;
-}
-
-static int ipod_audio_set_alt(struct usb_function *func, unsigned intf, unsigned alt)
-{
-	struct ipod_audio *audio = func_to_ipod_audio(func);
-	DBG(func->config->cdev, " = %s(%u,%u) \n", __FUNCTION__, intf, alt);
-
-	if (intf == audio->ac_intf) {
-		if (alt > 0) {
-			ERROR(func->config->cdev, "%s:%d Error!\n", __func__, __LINE__);
-			return -EINVAL;
-		}
+	/*
+	 * If the PCM stream is still running, start draining the ALSA ring
+	 * buffer with silence at the correct rate.  Without this the buffer
+	 * fills up while USB is stopped, ALSA declares an XRUN, and
+	 * bluealsa-aplay dies.
+	 */
+	if (audio->ss && audio->period_us)
+		schedule_delayed_work(&audio->silence_work,
+				 usecs_to_jiffies(audio->period_us));
 		return 0;
 	}
 
@@ -517,6 +574,7 @@ static int ipod_audio_bind(struct usb_configuration *conf, struct usb_function *
 	{
 		audio->in_req[i] = NULL;
 	}
+	INIT_DELAYED_WORK(&audio->silence_work, ipod_audio_silence_work_fn);
 
 	//AUDIO CARD
 	audio->pdev = platform_device_alloc("snd_usb_ipod", -1);
@@ -580,6 +638,8 @@ static void ipod_audio_unbind(struct usb_configuration *conf, struct usb_functio
 	int i;
 	struct ipod_audio *audio = func_to_ipod_audio(func);
 	DBG(conf->cdev, " = %s() \n", __FUNCTION__);
+
+	cancel_delayed_work_sync(&audio->silence_work);
 
 	if (audio->card != NULL)
 	{
