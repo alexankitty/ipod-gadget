@@ -417,30 +417,29 @@ static int ipod_audio_start(struct ipod_audio* audio) {
 	}
 	spin_unlock_irqrestore(&audio->play_lock, flags);
 
-	audio->in_ep_enabled = true;
 	ret = config_ep_by_speed(audio->func.config->cdev->gadget, &audio->func, audio->in_ep);
 	if (ret)
 	{
 		DBG(audio->func.config->cdev, "config_ep_by_speed FAILED!\n");
-		return ret;
+		goto start_fail;
 	}
-	
+
 	ret = usb_ep_enable(audio->in_ep);
 	if (ret < 0)
 	{
 		DBG(audio->func.config->cdev, "Enable IN endpoint FAILED!\n");
-		return ret;
+		goto start_fail;
 	}
 
 	usb_ep_fifo_flush(audio->in_ep);
-	
 
-	
 	for (i = 0; i < NUM_USB_AUDIO_TRANSFERS; i++){
 		if (!audio->in_req[i]) {
 			req = usb_ep_alloc_request(audio->in_ep, GFP_ATOMIC);
 			if(req == NULL) {
-				return -ENOMEM;
+				usb_ep_disable(audio->in_ep);
+				ret = -ENOMEM;
+				goto start_fail;
 			}
 			audio->in_req[i] = req;
 			req->zero = 0;
@@ -454,8 +453,22 @@ static int ipod_audio_start(struct ipod_audio* audio) {
 			ERROR(audio->func.config->cdev, "usb_ep_queue error on ep0\n");
 		}
 	}
-	
+
+	/* Only mark enabled after all setup has succeeded. */
+	audio->in_ep_enabled = true;
 	return 0;
+
+start_fail:
+	/*
+	 * Setup failed - USB is not actually running.  Make sure
+	 * in_ep_enabled stays false and restart the silence drain so the
+	 * ALSA ring buffer keeps moving and bluealsa-aplay doesn't block.
+	 */
+	audio->in_ep_enabled = false;
+	if (audio->ss && audio->period_us)
+		mod_delayed_work(system_wq, &audio->silence_work,
+				 usecs_to_jiffies(audio->period_us));
+	return ret;
 }
 
 static int ipod_audio_stop(struct ipod_audio* audio) {
