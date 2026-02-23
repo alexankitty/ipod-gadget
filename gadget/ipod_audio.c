@@ -25,8 +25,13 @@
 
 
 
-#define BUFFER_BYTES_MAX (PAGE_SIZE * 16)
-#define PRD_SIZE_MAX PAGE_SIZE
+/* ~3 seconds of audio at 44100 Hz stereo S16 – gives bluealsa-aplay the
+ * large buffer it requests (--pcm-buffer-time=2000000) so it never has to
+ * drop frames while the USB endpoint is temporarily stopped by the car. */
+#define BUFFER_BYTES_MAX (PAGE_SIZE * 128)
+/* ~186 ms period – large enough that jiffie-scheduler jitter is negligible
+ * relative to one period, small enough for low latency on resume. */
+#define PRD_SIZE_MAX (PAGE_SIZE * 8)
 
 #define MIN_PERIODS 4
 
@@ -67,9 +72,16 @@ struct ipod_audio {
 	 * this work advances hw_ptr and calls snd_pcm_period_elapsed so that
 	 * the ALSA ring buffer never fills up (which would cause an XRUN and
 	 * kill bluealsa-aplay).
+	 *
+	 * We use ktime to compute how many bytes SHOULD have been consumed
+	 * since USB stopped, so that late wake-ups catch up immediately rather
+	 * than falling behind and letting the buffer fill.
 	 */
 	struct delayed_work silence_work;
-	unsigned int period_us; /* period duration in microseconds */
+	unsigned int period_us;       /* period duration in microseconds */
+	u32 bytes_per_sec;            /* rate * channels * sample_bytes */
+	ktime_t silence_start_ktime;  /* ktime when silence drain began */
+	ssize_t silence_start_hw_ptr; /* hw_ptr value when silence drain began */
 };
 
 static inline struct ipod_audio *func_to_ipod_audio(struct usb_function *f)
@@ -136,6 +148,11 @@ static int ipod_audio_pcm_hw_params(struct snd_pcm_substream *substream,
 			audio->period_us = (unsigned int)div_u64(
 				(u64)params_period_size(hw_params) * USEC_PER_SEC,
 				params_rate(hw_params));
+			/* bytes/sec used by time-based silence drain */
+			audio->bytes_per_sec =
+				params_rate(hw_params) *
+				params_channels(hw_params) *
+				(snd_pcm_format_physical_width(params_format(hw_params)) / 8);
 		}
 	}
 	return err;
@@ -191,9 +208,12 @@ static int ipod_audio_pcm_trigger(struct snd_pcm_substream *substream, int cmd)
 			 * PCM (re)started while USB endpoint is still down
 			 * (e.g. bluealsa-aplay recovering an XRUN, or a new
 			 * bluetooth connection while the car hasn't sent
-			 * set_alt(1,1) yet).  Kick off the silence drain so
-			 * the buffer doesn't fill up and cause another XRUN.
+			 * set_alt(1,1) yet).  Restart the silence drain from
+			 * the current hw_ptr so the time-based accounting is
+			 * correct from this moment forward.
 			 */
+			audio->silence_start_ktime = ktime_get();
+			audio->silence_start_hw_ptr = audio->hw_ptr;
 			mod_delayed_work(system_wq, &audio->silence_work,
 					 usecs_to_jiffies(audio->period_us));
 		}
@@ -220,19 +240,43 @@ static void ipod_audio_silence_work_fn(struct work_struct *work)
 						struct ipod_audio, silence_work);
 	struct snd_pcm_substream *substream;
 	unsigned long flags;
+	bool update_alsa = false;
 
 	spin_lock_irqsave(&audio->play_lock, flags);
 	substream = audio->ss;
-	/* Only keep draining if USB is still stopped and stream is alive */
-	if (!audio->in_ep_enabled && substream && audio->period_size && audio->dma_bytes) {
-		audio->hw_ptr = (audio->hw_ptr + audio->period_size) % audio->dma_bytes;
+
+	if (!audio->in_ep_enabled && substream &&
+	    audio->period_size && audio->dma_bytes && audio->bytes_per_sec) {
+		/*
+		 * Compute how many bytes SHOULD have been consumed since the
+		 * silence drain started, based on wall-clock time.  This means
+		 * even if this work item fired late (scheduler jitter), we
+		 * immediately catch up to where hw_ptr should be, rather than
+		 * advancing by only one period and leaving the buffer too full.
+		 */
+		s64 elapsed_ns = ktime_to_ns(
+			ktime_sub(ktime_get(), audio->silence_start_ktime));
+		s64 should_have_consumed = div_s64(
+			elapsed_ns * (s64)audio->bytes_per_sec, NSEC_PER_SEC);
+
+		/*
+		 * Clamp to at most (dma_bytes - period_size) ahead of the start
+		 * position so we never lap appl_ptr and cause a spurious xrun.
+		 */
+		if (should_have_consumed > (s64)(audio->dma_bytes - audio->period_size))
+			should_have_consumed = (s64)(audio->dma_bytes - audio->period_size);
+
+		audio->hw_ptr = (audio->silence_start_hw_ptr + (ssize_t)should_have_consumed)
+				% (ssize_t)audio->dma_bytes;
+		update_alsa = true;
 	} else {
 		substream = NULL;
 	}
 	spin_unlock_irqrestore(&audio->play_lock, flags);
 
 	if (substream) {
-		snd_pcm_period_elapsed(substream);
+		if (update_alsa)
+			snd_pcm_period_elapsed(substream);
 		schedule_delayed_work(&audio->silence_work,
 				 usecs_to_jiffies(audio->period_us));
 	}
@@ -433,6 +477,9 @@ static int ipod_audio_start(struct ipod_audio* audio) {
 
 	usb_ep_fifo_flush(audio->in_ep);
 
+	/* Mark enabled before queuing so completion handlers see it correctly. */
+	audio->in_ep_enabled = true;
+
 	for (i = 0; i < NUM_USB_AUDIO_TRANSFERS; i++){
 		if (!audio->in_req[i]) {
 			req = usb_ep_alloc_request(audio->in_ep, GFP_ATOMIC);
@@ -454,8 +501,6 @@ static int ipod_audio_start(struct ipod_audio* audio) {
 		}
 	}
 
-	/* Only mark enabled after all setup has succeeded. */
-	audio->in_ep_enabled = true;
 	return 0;
 
 start_fail:
@@ -463,11 +508,16 @@ start_fail:
 	 * Setup failed - USB is not actually running.  Make sure
 	 * in_ep_enabled stays false and restart the silence drain so the
 	 * ALSA ring buffer keeps moving and bluealsa-aplay doesn't block.
+	 * Reset the time baseline so the time-based drain calculation
+	 * doesn't overshoot due to a stale start time.
 	 */
 	audio->in_ep_enabled = false;
-	if (audio->ss && audio->period_us)
+	if (audio->ss && audio->period_us) {
+		audio->silence_start_ktime = ktime_get();
+		audio->silence_start_hw_ptr = audio->hw_ptr;
 		mod_delayed_work(system_wq, &audio->silence_work,
 				 usecs_to_jiffies(audio->period_us));
+	}
 	return ret;
 }
 
@@ -489,13 +539,15 @@ static int ipod_audio_stop(struct ipod_audio* audio) {
 
 	/*
 	 * If the PCM stream is still running, start draining the ALSA ring
-	 * buffer with silence at the correct rate.  Without this the buffer
-	 * fills up while USB is stopped, ALSA declares an XRUN, and
-	 * bluealsa-aplay dies.
+	 * buffer at the correct rate so bluealsa-aplay never sees avail==0.
+	 * Record the start point for the time-based hw_ptr calculation.
 	 */
-	if (audio->ss && audio->period_us)
+	if (audio->ss && audio->period_us) {
+		audio->silence_start_ktime = ktime_get();
+		audio->silence_start_hw_ptr = audio->hw_ptr;
 		schedule_delayed_work(&audio->silence_work,
 				 usecs_to_jiffies(audio->period_us));
+	}
 	return 0;
 }
 
