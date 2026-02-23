@@ -181,11 +181,22 @@ static int ipod_audio_pcm_trigger(struct snd_pcm_substream *substream, int cmd)
 
 	spin_unlock_irqrestore(&audio->play_lock, flags);
 
-	/* Clear buffer after Play stops */
-	if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK && !audio->ss) {
-		/* PCM stream is ending - stop the silence drain work */
-		cancel_delayed_work(&audio->silence_work);
-		memset(audio->rbuf, 0, MAX_USB_AUDIO_PACKET_SIZE * NUM_USB_AUDIO_TRANSFERS);
+	if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK) {
+		if (!audio->ss) {
+			/* PCM stream is ending - stop the silence drain work */
+			cancel_delayed_work(&audio->silence_work);
+			memset(audio->rbuf, 0, MAX_USB_AUDIO_PACKET_SIZE * NUM_USB_AUDIO_TRANSFERS);
+		} else if (!audio->in_ep_enabled && audio->period_us) {
+			/*
+			 * PCM (re)started while USB endpoint is still down
+			 * (e.g. bluealsa-aplay recovering an XRUN, or a new
+			 * bluetooth connection while the car hasn't sent
+			 * set_alt(1,1) yet).  Kick off the silence drain so
+			 * the buffer doesn't fill up and cause another XRUN.
+			 */
+			mod_delayed_work(system_wq, &audio->silence_work,
+					 usecs_to_jiffies(audio->period_us));
+		}
 	}
 
 	return err;
@@ -388,7 +399,7 @@ static int ipod_audio_start(struct ipod_audio* audio) {
 	}
 
 	/* Stop draining the ALSA buffer with silence - USB is taking over */
-	cancel_delayed_work_sync(&audio->silence_work);
+	cancel_delayed_work(&audio->silence_work);
 
 	/*
 	 * Sync our hw_ptr to just behind the current appl_ptr so we play the
